@@ -299,6 +299,8 @@ static jc_runtime_t *runtime;
 static bool runtime_ready;
 static bool runtime_failed;
 static bool runtime_replay_silent;
+static bool story_frame_presented;
+static unsigned held_story_frames;
 static jc_captions_t captions;
 static jc_caption_render_options_t caption_render_options;
 static uint8_t *ocean_pcm;
@@ -2645,11 +2647,26 @@ static bool begin_automatic_fade(char *error, size_t error_size)
     return true;
 }
 
+/* A thread that ended this tick may have drawn without an update. */
+static bool story_thread_ended(const uint8_t *previous_states)
+{
+    size_t index;
+
+    for (index = 0u; index < JC_SCRIPT_MAX_THREADS; ++index) {
+        if (previous_states[index] == 1u &&
+            runtime->vm.threads[index].state == 2u)
+            return true;
+    }
+    return false;
+}
+
 static void tick_story_runtime(void)
 {
     jc_script_error_t error;
     jc_script_tick_result_t result;
     char message[256];
+    uint8_t previous_states[JC_SCRIPT_MAX_THREADS];
+    size_t thread_index;
 
     if (!runtime_ready || runtime == NULL || runtime_failed || diagnostic_display ||
         selected_chapter == NULL)
@@ -2718,7 +2735,12 @@ static void tick_story_runtime(void)
         }
         return;
     }
+    for (thread_index = 0u; thread_index < JC_SCRIPT_MAX_THREADS;
+         ++thread_index)
+        previous_states[thread_index] = runtime->vm.threads[thread_index].state;
     result = jc_runtime_tick(runtime, &error);
+    if (result == JC_SCRIPT_TICK_WAITING && story_thread_ended(previous_states))
+        result = JC_SCRIPT_TICK_FRAME;
     if (result == JC_SCRIPT_TICK_FRAME) {
         const jc_surface_t *surface;
         const jc_palette_t *palette = story_runtime_palette(runtime);
@@ -2783,11 +2805,41 @@ static void tick_story_runtime(void)
     }
 }
 
+/* Frames composed before a started thread first draws lack its output. */
+#define MAX_HELD_STORY_FRAMES 4u
+
+static bool story_thread_undrawn(void)
+{
+    size_t index;
+
+    if (!game_loaded || !runtime_ready || runtime == NULL || runtime_failed)
+        return false;
+    for (index = 0u; index < JC_SCRIPT_MAX_THREADS; ++index) {
+        if (runtime->vm.threads[index].state == 1u &&
+            !runtime->vm.threads[index].has_yielded)
+            return true;
+    }
+    return false;
+}
+
 static void present_video_frame(void)
 {
     const char *caption = jc_captions_current_text(&captions);
     const jc_holiday_extra_t *holiday = NULL;
 
+    if (story_frame_presented && story_thread_undrawn() &&
+        held_story_frames < MAX_HELD_STORY_FRAMES) {
+        ++held_story_frames;
+#ifdef EMSCRIPTEN
+        video_cb(NULL, JC_FRAME_WIDTH, JC_FRAME_HEIGHT, 0u);
+#else
+        video_cb(video_output, JC_FRAME_WIDTH, JC_FRAME_HEIGHT,
+                 JC_FRAME_WIDTH * sizeof(uint32_t));
+#endif
+        return;
+    }
+    held_story_frames = 0u;
+    story_frame_presented = true;
     memcpy(video_output, jc_core_framebuffer(&core), sizeof(video_output));
     if (holiday_selection.mode == JC_HOLIDAY_OVERLAY_AUTO) {
         time_t now = time(NULL);
@@ -3998,6 +4050,8 @@ void retro_unload_game(void)
 {
     reset_web_audio_clock();
     game_loaded = false;
+    story_frame_presented = false;
+    held_story_frames = 0u;
     jc_captions_clear(&captions);
     if (runtime != NULL) {
         jc_runtime_destroy(runtime);
